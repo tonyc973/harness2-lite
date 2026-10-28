@@ -14,7 +14,7 @@ import os
 
 import h2lite
 
-chat = h2lite.openai_chat(os.environ.get("AGENT_MODEL", "gpt-4o-mini"))
+chat = h2lite.openai_chat(os.environ.get("AGENT_MODEL", "gpt-4o-mini"), temperature=0)
 
 REQUEST = ("Extract the invoice date, the total amount and the currency from the text. Reply with a JSON "
            "object with the keys date (YYYY-MM-DD), total (a number) and currency (ISO 4217 code).\n\nText: ")

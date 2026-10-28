@@ -12,6 +12,24 @@ It is a small, dependency-free take on Google's
 and drops the benchmark machinery: about 600 lines of standard-library Python, any agent, any
 OpenAI-compatible model.
 
+## Why this exists
+
+I started from the Harness² research. I read the paper and the whole codebase (nearly 16,000 lines of
+Python, built to run professional benchmarks on Vertex AI with agentic editors, Docker and pinned
+dependencies) and asked one question: **what is the core that makes it work, and how small can
+it be while keeping most of the impact?**
+
+The answer turned out to be a handful of ideas:
+- improve the instructions, not the model;
+- edit only what the agent's own runs show is wrong;
+- split *how the agent works* from *what it knows*;
+- test every edit and keep it only if it measurably helps;
+- write down what you learned.
+
+`h2lite` is that core, made simple enough to plug into any agent in a few minutes. The goal is
+the most impact for the least machinery, so people can use the idea on their own projects
+instead of only reading about it.
+
 ```
 your agent's files ──► run on tasks ──► editors propose edits ──► run each edit ──► keep the best,
    (system.md, ...)       (traces)        ("process", "knowledge")    (same tasks)     only if it beats
@@ -34,7 +52,8 @@ round 1/1
   process: no change proposed
   knowledge: advantage +1.000
   kept `knowledge`
-done: train 0.000 -> 1.000, test 0.000 -> 1.000 | agent runs 8, llm calls 2, cache hits 0 | see runs/demo/report.md
+  held-out test: 1.000
+done: train 0.000 -> 1.000, test 0.000 -> 1.000 | agent runs 8, llm calls 2, cache hits 1 | see runs/demo/report.md
 ```
 The demo agent computes invoice totals with VAT. It uses 19%, Romania's old rate, unless its
 instructions say otherwise. The scripted editor sees `VAT used: 19%` in every run and adds the
@@ -53,7 +72,28 @@ A `gpt-4o-mini` agent extracts date, total and currency from Romanian invoices. 
 on `1.234,50` (= 1234.50), day-first dates like `7/11/2025`, `lei` → `RON`, and JSON wrapped in
 code fences. The editor sees the outputs, the parse errors and the scores, but **never the expected
 answers**. Three held-out tasks (`TEST_TASKS`) show whether the edits generalise or only fit the
-training tasks. It costs cents. Results vary from run to run; read `report.md`.
+training tasks. It costs cents.
+
+**A real run** (`gpt-4o-mini` as both agent and editor, 2 rounds, 42 agent calls, 6 editor calls,
+about 15 seconds; full report in [examples/invoice_extract/sample_report.md](examples/invoice_extract/sample_report.md)):
+
+```
+start: train 0.000, test 0.000
+round 1/2
+  process: advantage +1.000
+  knowledge: advantage +0.000
+  kept `process`
+  held-out test: 0.889
+round 2/2
+  ...
+  kept the current harness
+done: train 0.000 -> 1.000, test 0.000 -> 0.889
+```
+- **What was wrong:** the model wrapped every answer in ```` ```json ```` fences, so a strict parser failed every time.
+- **What the editor did:** it saw `json.loads failed` in all six runs and added one line to `system.md`. That was enough: train went to 1.0.
+- **Why round 2 kept the harness as it was:** no candidate beat it.
+- **What is still wrong:** one held-out answer read `12/10/2025` month-first. No training run had a date error, so the editor had nothing to fix. That is the method's honest limit: **it fixes what your runs show**, so pick tasks that cover the cases you care about.
+- **What a noisy run looks like:** in an earlier run at temperature 1, round 2 pushed train to 1.0 while held-out fell from 1.0 to 0.33. The cause was luck (fences appearing at random), not a real fix. h2lite now measures the held-out score after every round and prints a WARNING when it drops. Use `repeats=2+` with a non-deterministic agent.
 
 ---
 
@@ -158,6 +198,7 @@ as the editor even when the agent runs on a small one: the editor's judgment is 
 | File | What it is |
 |---|---|
 | `harness/` | the best harness found: copy it back into your project |
+| `rounds/N/` | the harness after each round, in case an earlier one did better on held-out tasks |
 | `report.md` | scores before/after, every candidate with its notes and diff, and the final diff |
 | `lessons.md` | one line per attempt: `- [kept, +0.250] (knowledge) <why, citing the runs>` |
 | `history.jsonl` | the same, machine-readable |
@@ -176,7 +217,7 @@ One **round** is the Harness² step, simplified:
 3. **Validate.** The reply must be JSON, touch only allowed file names (no `../`), and stay under the size cap. An invalid reply gets **one retry with the exact error**; after that it is dropped.
 4. **Probe.** Each valid candidate runs on the same tasks.
 5. **Compose.** If there are two or more candidates, a composer sees their diffs and results, merges what helped and drops what hurt. The result is one more candidate.
-6. **Keep or not.** The best candidate replaces the current harness **only if it is strictly better**: a higher mean score, or a judge win rate above 50%. A tie keeps the current harness.
+6. **Keep or not.** The best candidate replaces the current harness **only if it is strictly better**: a higher mean score, or a judge win rate above 50%. A tie keeps the current harness. Held-out tasks are then scored, for you to read. They are never shown to the editors and never used to choose.
 7. **Learn.** Every attempt is written to the lessons with its measured effect, so later rounds and later projects do not repeat what failed.
 
 The editor prompts carry the Harness² rules that matter most:
@@ -206,7 +247,7 @@ valid), without knowing which harness produced which.
 - **5–20 tasks** that represent the real work beat 200 random ones. Read `report.md` after each run.
 - **Hold out tasks** (`TEST_TASKS`). If train goes up and test does not, the editor is fitting your examples.
 - **`repeats=2` or more** with an LLM agent: one lucky run should not decide.
-- **Cost per round** is about `tasks × repeats × (number of candidates, up to focuses + 1)` agent runs, plus one editor call per focus and one for compose. Without `score`, add one judge call per compared run.
+- **Cost per round** is about `tasks × repeats × (number of candidates, up to focuses + 1)` agent runs, plus `test_tasks × repeats` for the held-out check, one editor call per focus and one for compose. Without `score`, add one judge call per compared run.
 - **Start small.** A one-file harness with a few lines is fine. The editor adds what the runs show is missing.
 
 ## Tests
@@ -215,8 +256,8 @@ valid), without knowing which harness produced which.
 python tests/test_h2lite.py        # or: pytest
 ```
 Offline, with fake agents and fake LLMs. They cover the demo, retry-with-feedback, bad file names,
-the size cap, the blind judge, crashing agents, compose, shared lessons, `shell_agent` and the
-OpenAI protocol (against a local fake server).
+the size cap, the blind judge, crashing agents, compose, shared lessons, the held-out drop warning,
+`shell_agent` and the OpenAI protocol (against a local fake server).
 
 ## Credits
 

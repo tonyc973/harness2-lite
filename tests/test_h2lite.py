@@ -138,6 +138,24 @@ def test_shared_lessons_are_read_and_not_duplicated():
         assert len(lines) == 2 and "[not kept" in lines[1]
 
 
+def test_held_out_drop_is_measured_per_round_and_warned():
+    def agent(h, task):
+        return "good" if "rule" in h["system.md"] else "bad"
+
+    def score(task, output):  # the edit helps the training tasks and hurts the held-out one
+        return float((output == "good") == task.startswith("train"))
+
+    logs = []
+    with tempfile.TemporaryDirectory() as out:
+        res = improve({"system.md": "x"}, ["train1"], agent, test_tasks=["test1"], score=score,
+                      llm=_fake_llm([json.dumps({"files": {"system.md": "rule"}})]), focuses=["process"],
+                      out=out, log=logs.append, workers=1)
+        assert (Path(out) / "rounds/1/system.md").read_text() == "rule"
+        assert "WARNING" in (Path(out) / "report.md").read_text()
+    assert (res.train_after, res.test_before, res.test_after) == (1.0, 1.0, 0.0)
+    assert res.history[0]["test"] == 0.0 and any(line.startswith("WARNING") for line in logs)
+
+
 def test_shell_agent_runs_any_program():
     run = shell_agent(f'{sys.executable} -c "import json,os,sys; t=json.load(sys.stdin); '
                       f'print(open(os.environ[\'H2LITE_HARNESS\']+\'/system.md\').read().strip(), t)"')

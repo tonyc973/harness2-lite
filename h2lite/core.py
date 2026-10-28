@@ -376,7 +376,11 @@ class Optimizer:
                 f"Its runs:\n{self._show_runs(c['runs'])}" for c in cands)
             new, notes, err = self.edit(COMPOSE.format(rules=rules, harness=_show_harness(h),
                                                        candidates=shown, reply=reply), h)
-            if new and new != h and all(new != c["harness"] for c in cands):
+            if err:
+                self.log(f"  composed: rejected ({err[:120]})")
+            elif new == h or any(new == c["harness"] for c in cands):
+                self.log("  composed: nothing new (same as the current harness or a candidate)")
+            else:
                 c = {"name": "composed", "harness": new, "notes": notes}
                 c["runs"] = self.evaluate(new, tasks)
                 c["advantage"] = self.advantage(runs, c["runs"])
@@ -434,13 +438,18 @@ def improve(harness, tasks: Sequence, run: Agent, *, llm: LLM, score=None, round
             log(f"  kept `{r['best']['name']}`")
         else:
             log("  kept the current harness")
+        save_harness(h, out / "rounds" / str(i))  # every round's harness, so you can pick another one
+        if test_tasks and score:  # measured, never shown to the editors, never used to choose
+            test_runs = opt.evaluate(h, test_tasks)
+            res.history[-1]["test"] = _mean(test_runs)
+            log(f"  held-out test: {_fmt(_mean(test_runs))}")
         learned += lines  # the gate: only measured attempts, with their measured effect, become lessons
 
     res.harness = h
     res.train_after = _mean(runs)
-    if test_tasks and score:
-        res.test_after = _mean(opt.evaluate(h, test_tasks))
-    _write_outputs(out, original, res, opt.stats, learned)
+    test_runs = opt.evaluate(h, test_tasks) if test_tasks and score else []  # cached when rounds > 0
+    res.test_after = _mean(test_runs)
+    _write_outputs(out, original, res, opt.stats, learned, runs, test_runs, opt.describe)
     new = [line for line in learned if line not in prior]
     if shared and new:  # append only what the library does not already hold
         shared.parent.mkdir(parents=True, exist_ok=True)
@@ -450,10 +459,21 @@ def improve(harness, tasks: Sequence, run: Agent, *, llm: LLM, score=None, round
         + (f", test {_fmt(res.test_before)} -> {_fmt(res.test_after)}" if test_tasks and score else "")
         + f" | agent runs {opt.stats['agent_runs']}, llm calls {opt.stats['llm_calls']},"
           f" cache hits {opt.stats['cache_hits']} | see {out / 'report.md'}")
+    if _dropped(res):
+        log(f"WARNING: {_dropped(res)}")
     return res
 
 
-def _write_outputs(out: Path, original: Harness, res: Result, stats: dict, learned: list) -> None:
+def _dropped(res: Result) -> str:
+    if res.test_before is None or res.test_after is None or res.test_after >= res.test_before:
+        return ""
+    return (f"the held-out test score dropped ({_fmt(res.test_before)} -> {_fmt(res.test_after)}). "
+            "The kept edits may fit luck or the training tasks: compare the rounds in report.md "
+            "(each round's harness is in rounds/), and use --repeats 2+ so one lucky run does not decide.")
+
+
+def _write_outputs(out: Path, original: Harness, res: Result, stats: dict, learned: list,
+                   runs: list, test_runs: list, describe) -> None:
     save_harness(res.harness, out / "harness")
     (out / "lessons.md").write_text("".join(f"{line}\n" for line in learned), encoding="utf-8")
     with (out / "history.jsonl").open("w", encoding="utf-8") as f:
@@ -463,11 +483,21 @@ def _write_outputs(out: Path, original: Harness, res: Result, stats: dict, learn
              f"- train score: {_fmt(res.train_before)} -> {_fmt(res.train_after)}",
              f"- test score (held out): {_fmt(res.test_before)} -> {_fmt(res.test_after)}",
              f"- agent runs: {stats['agent_runs']}, llm calls: {stats['llm_calls']}, cache hits: {stats['cache_hits']}",
+             *([f"- **WARNING:** {_dropped(res)}"] if _dropped(res) else []),
              "", "## Rounds"]
     for row in res.history:
-        lines.append(f"\n### Round {row['round']}: kept {row['kept'] or 'the current harness'}")
+        test = f" (held-out test after it: {_fmt(row['test'])})" if "test" in row else ""
+        lines.append(f"\n### Round {row['round']}: kept {row['kept'] or 'the current harness'}{test}")
         for c in row["candidates"]:
             lines += [f"\n**{c['name']}** (advantage {c['advantage']:+.3f})", "", c["notes"] or "(no notes)",
                       "", "```diff", c["diff"].rstrip(), "```"]
-    lines += ["", "## Final change (original -> best)", "", "```diff", _diff(original, res.harness).rstrip(), "```", ""]
+    lines += ["", "## Final change (original -> best)", "", "```diff", _diff(original, res.harness).rstrip(), "```",
+              ""]
+    for title, rs in (("training", runs), ("held-out test", test_runs)):
+        if rs:
+            lines += [f"## Final runs on the {title} tasks (worst first)", ""]
+            for r in sorted(rs, key=lambda r: r.score if r.score is not None else 0.0):
+                shown = " ".join((r.error or r.output).split())
+                lines.append(f"- **{_fmt(r.score)}** | {_clip(describe(r.task), 90)} -> `{_clip(shown, 160)}`")
+            lines.append("")
     (out / "report.md").write_text("\n".join(lines), encoding="utf-8")

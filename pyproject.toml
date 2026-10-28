@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "h2lite"
+version = "0.1.0"
+description = "Make an AI agent better by letting an LLM rewrite its instruction files, from its own runs. A small take on Google's Harness²."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+h2lite = "h2lite.cli:main"
+
+[tool.setuptools]
+packages = ["h2lite"]
